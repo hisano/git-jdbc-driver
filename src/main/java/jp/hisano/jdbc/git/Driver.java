@@ -7,14 +7,15 @@ import java.sql.DriverPropertyInfo;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Types;
-import java.util.ArrayList;
+import java.util.List;
 import java.util.Properties;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.BiConsumer;
 import java.util.logging.Logger;
 
 import org.eclipse.jgit.api.Git;
+import org.eclipse.jgit.api.errors.GitAPIException;
 import org.eclipse.jgit.lib.Repository;
-import org.eclipse.jgit.revwalk.RevCommit;
 import org.eclipse.jgit.storage.file.FileRepositoryBuilder;
 import org.h2.api.ErrorCode;
 import org.h2.engine.Constants;
@@ -26,11 +27,12 @@ import org.h2.jdbc.JdbcConnection;
 import org.h2.message.DbException;
 import org.h2.schema.FunctionAlias;
 import org.h2.schema.Schema;
-import org.h2.schema.SchemaObject;
 import org.h2.table.FunctionTable;
 import org.h2.tools.SimpleResultSet;
 import org.h2.util.Utils;
 import org.h2.value.ValueVarchar;
+
+import static java.util.Arrays.*;
 
 public class Driver implements java.sql.Driver {
 	private static final Driver INSTANCE = new Driver();
@@ -42,6 +44,8 @@ public class Driver implements java.sql.Driver {
 	private static final int VERSION_MAJOR = 1;
 	private static final int VERSION_MINOR = 0;
 
+	private static final String TABLE_COMMITS = "COMMITS";
+
 	static {
 		try {
 			Class.forName("org.h2.Driver");
@@ -50,6 +54,10 @@ public class Driver implements java.sql.Driver {
 		}
 
 		registerDriver();
+	}
+
+	private static <E extends Throwable> void sneakyThrow(Throwable e) throws E {
+		throw (E) e;
 	}
 
 	@Override
@@ -64,12 +72,24 @@ public class Driver implements java.sql.Driver {
 			JdbcConnection jdbcConnection = new JdbcConnection("jdbc:h2:mem:", info, null, null, false);
 
 			SessionLocal sessionLocal = (SessionLocal) jdbcConnection.getSession();
-			sessionLocal.getDatabase().addSchemaObject(sessionLocal, getCommitsTable(sessionLocal, gitRepositoryDirectoryPath));
+			addFunctionTable(gitRepositoryDirectoryPath, sessionLocal, TABLE_COMMITS);
 
 			return jdbcConnection;
 		} else {
 			return null;
 		}
+	}
+
+	private void addFunctionTable(String gitRepositoryDirectoryPath, SessionLocal sessionLocal, String tableName) {
+		Schema mainSchema = sessionLocal.getDatabase().getMainSchema();
+
+		FunctionAlias functionAlias = FunctionAlias.newInstance(mainSchema, 0, tableName, Driver.class.getName() + ".git", false);
+		List<Expression> arguments = Utils.newSmallArrayList();
+		arguments.add(ValueExpression.get(ValueVarchar.get(gitRepositoryDirectoryPath, sessionLocal)));
+		arguments.add(ValueExpression.get(ValueVarchar.get(tableName, sessionLocal)));
+		JavaTableFunction javaTableFunction = new JavaTableFunction(functionAlias, arguments.toArray(new Expression[0]));
+
+		sessionLocal.getDatabase().addSchemaObject(sessionLocal, new FunctionTable(mainSchema, sessionLocal, javaTableFunction));
 	}
 
 	@Override
@@ -115,40 +135,55 @@ public class Driver implements java.sql.Driver {
 		}
 	}
 
-	private static SchemaObject getCommitsTable(SessionLocal session, String gitRepositoryDirectoryPath) {
-		Schema mainSchema = session.getDatabase().getMainSchema();
+	public static ResultSet git(Connection connection, String gitRepositoryDirectoryPath, String tableName) throws Exception {
+		Column[] columns = null;
+		BiConsumer<Git, SimpleResultSet> rowAdder = null;
+		switch (tableName) {
+			case TABLE_COMMITS:
+				columns = new Column[]{
+						new Column("AUTHOR", Types.VARCHAR),
+						new Column("MESSAGE", Types.VARCHAR)
+				};
+				rowAdder = (git, simpleResultSet) -> {
+					try {
+						git.log().call().forEach(commit -> {
+							simpleResultSet.addRow(
+									commit.getAuthorIdent().getName(),
+									commit.getFullMessage()
+							);
+						});
+					} catch (GitAPIException e) {
+						sneakyThrow(e);
+					}
+				};
+				break;
+		}
 
-		FunctionAlias functionAlias = FunctionAlias.newInstance(mainSchema, 0, "COMMITS", Driver.class.getName() + ".git", false);
-		ArrayList<Expression> argList = Utils.newSmallArrayList();
-		argList.add(ValueExpression.get(ValueVarchar.get(gitRepositoryDirectoryPath, session)));
-		argList.add(ValueExpression.get(ValueVarchar.get("COMMITS", session)));
-		JavaTableFunction javaTableFunction = new JavaTableFunction(functionAlias, argList.toArray(new Expression[0]));
+		SimpleResultSet simpleResultSet = new SimpleResultSet();
 
-		return new FunctionTable(mainSchema, session, javaTableFunction);
-	}
-
-	public static ResultSet git(Connection connection, String gitRepositoryPath, String tableName) throws Exception {
-		SimpleResultSet result = new SimpleResultSet();
-		result.addColumn("AUTHOR", Types.VARCHAR, 0, 0);
-		result.addColumn("MESSAGE", Types.VARCHAR, 0, 0);
+		asList(columns).forEach(column -> simpleResultSet.addColumn(column._name, column._sqlType, 0, 0));
 
 		String url = connection.getMetaData().getURL();
 		if (url.equals("jdbc:columnlist:connection")) {
-			return result;
+			return simpleResultSet;
 		}
 
-		FileRepositoryBuilder repositoryBuilder = new FileRepositoryBuilder();
-		try (Repository repository = repositoryBuilder.setGitDir(new File(gitRepositoryPath, ".git")).readEnvironment().findGitDir().build()) {
+		try (Repository repository = new FileRepositoryBuilder().setGitDir(new File(gitRepositoryDirectoryPath, ".git")).readEnvironment().findGitDir().build()) {
 			try (Git git = new Git(repository)) {
-				Iterable<RevCommit> commits = git.log().call();
-				for (RevCommit commit : commits) {
-					result.addRow(
-							commit.getAuthorIdent().getName(),
-							commit.getFullMessage()
-					);
-				}
+				rowAdder.accept(git, simpleResultSet);
 			}
 		}
-		return result;
+
+		return simpleResultSet;
+	}
+
+	private static class Column {
+		private String _name;
+		private int _sqlType;
+
+		Column(String name, int sqlType) {
+			_name = name;
+			_sqlType = sqlType;
+		}
 	}
 }
