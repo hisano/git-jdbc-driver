@@ -7,6 +7,7 @@ import java.sql.DriverPropertyInfo;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Types;
+import java.util.Date;
 import java.util.List;
 import java.util.Properties;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -142,13 +143,31 @@ public class Driver implements java.sql.Driver {
 			case TABLE_COMMITS:
 				columns = new Column[]{
 						new Column("AUTHOR", Types.VARCHAR),
-						new Column("MESSAGE", Types.VARCHAR)
+						new Column("AUTHOR_EMAIL", Types.VARCHAR),
+
+						new Column("COMMITTER", Types.VARCHAR),
+						new Column("COMMITTER_EMAIL", Types.VARCHAR),
+
+						new Column("HASH", Types.VARCHAR),
+						new Column("DATE", Types.DATE),
+
+						new Column("MESSAGE", Types.VARCHAR),
+						new Column("FULL_MESSAGE", Types.VARCHAR)
 				};
 				rowAdder = (git, simpleResultSet) -> {
 					try {
 						git.log().call().forEach(commit -> {
 							simpleResultSet.addRow(
 									commit.getAuthorIdent().getName(),
+									commit.getAuthorIdent().getEmailAddress(),
+
+									commit.getCommitterIdent().getName(),
+									commit.getCommitterIdent().getEmailAddress(),
+
+									commit.getId().getName(),
+									commit.getCommitterIdent().getWhen(),
+
+									commit.getShortMessage(),
 									commit.getFullMessage()
 							);
 						});
